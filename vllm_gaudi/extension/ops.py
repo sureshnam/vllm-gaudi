@@ -31,6 +31,7 @@ if is_hpu_gaudi2:
 import os
 # MAX_EXPERTS_PER_SLICE is needed for 1.20, up to 64 experts per slice
 MAX_EXPERTS_PER_SLICE = int(os.environ.get("MAX_EXPERTS_PER_SLICE", -1))
+VLLM_MOE_PYTORCH_FALLBACK = os.environ.get("VLLM_MOE_PYTORCH_FALLBACK", "0") == "1"
 
 
 def get_inc_quant_method(layer):
@@ -1175,6 +1176,59 @@ class VllmMixtureOfExpertsOpFP8(VllmMixtureOfExpertsOpBase):
         return final_hidden_states
 
 
+@torch.compiler.disable
+def _pytorch_moe_fallback(x, topk_ids, topk_weights, w13_list, w2_list,
+                          permuted_weights=True, activation="silu"):
+    """Pure PyTorch MoE fallback for when HPU MoE kernel doesn't support
+    the model dimensions (e.g. 512 experts with small intermediate size).
+    Uses masked matmul (no boolean indexing) for HPU compatibility.
+    Only processes selected experts for performance."""
+    num_tokens, hidden_size = x.shape
+    topk = topk_ids.shape[1]
+
+    output = torch.zeros(num_tokens, hidden_size, dtype=x.dtype, device=x.device)
+
+    # Get unique selected experts on CPU (safe with eager pipeline disabled)
+    selected_experts = sorted(set(topk_ids.cpu().flatten().tolist()))
+
+    for expert_idx in selected_experts:
+        # Compute expert weight: sum of topk_weights where this expert is selected
+        expert_mask = (topk_ids == expert_idx).to(x.dtype)  # (num_tokens, topk)
+        expert_weight = (expert_mask * topk_weights.to(x.dtype)).sum(dim=1, keepdim=True)
+
+        w13 = w13_list[expert_idx]
+        w2 = w2_list[expert_idx]
+
+        # gate+up projection for all tokens
+        if permuted_weights:
+            gate_up = x @ w13.t()
+        else:
+            gate_up = x @ w13
+
+        inter_size = gate_up.shape[-1] // 2
+        gate = gate_up[:, :inter_size]
+        up = gate_up[:, inter_size:]
+
+        if activation == "silu":
+            hidden = F.silu(gate) * up
+        elif activation == "gelu":
+            hidden = F.gelu(gate) * up
+        else:
+            hidden = gate * up
+
+        # down projection
+        if permuted_weights:
+            expert_out = hidden @ w2.t()
+        else:
+            expert_out = hidden @ w2
+
+        # Accumulate weighted output (only non-zero where expert was selected)
+        output = output + expert_out * expert_weight
+
+        # No explicit graph flush - rely on eager mode
+    return output
+
+
 class VllmMixtureOfExpertsOpFP8PerChannel(VllmMixtureOfExpertsOpBase):
 
     def __init__(self,
@@ -1197,6 +1251,29 @@ class VllmMixtureOfExpertsOpFP8PerChannel(VllmMixtureOfExpertsOpBase):
         permuted_weights=True,
         activation="silu",
     ):
+        if VLLM_MOE_PYTORCH_FALLBACK:
+            # Dequantize FP8 weights manually and use pure PyTorch MoE
+            experts_range = range(self.num_experts)
+            w13_list = []
+            w2_list = []
+            for i in experts_range:
+                w = self.w13_list[i].weight.squeeze()
+                s = self.w13_list[i].scale_inv_fp8.squeeze()
+                # Channel-wise: scale is per output channel, needs unsqueeze for broadcast
+                if s.dim() == 1 and w.dim() == 2 and s.shape[0] == w.shape[0]:
+                    w13_list.append((w.to(s.dtype) * s.unsqueeze(1)).to(x.dtype))
+                else:
+                    w13_list.append(self.w13_list[i].get_dequant_weight().to(x.dtype))
+                w = self.w2_list[i].weight.squeeze()
+                s = self.w2_list[i].scale_inv_fp8.squeeze()
+                if s.dim() == 1 and w.dim() == 2 and s.shape[0] == w.shape[0]:
+                    w2_list.append((w.to(s.dtype) * s.unsqueeze(1)).to(x.dtype))
+                else:
+                    w2_list.append(self.w2_list[i].get_dequant_weight().to(x.dtype))
+            return _pytorch_moe_fallback(x, topk_ids, topk_weights,
+                                         w13_list, w2_list,
+                                         permuted_weights, activation)
+
         tokens_num, _ = x.shape
         kwargs = self._get_extra_kwargs(tokens_num)
         experts_range = range(self.num_experts)

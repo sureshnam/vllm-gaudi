@@ -5,7 +5,7 @@
 ###############################################################################
 
 from dataclasses import dataclass
-from typing import Optional, Union
+from typing import Any, Optional, Union
 from vllm.v1.attention.backend import MultipleOf
 
 import torch
@@ -52,6 +52,7 @@ class HPUAttentionMetadataV1(HPUAttentionMetadata):
     query_start_loc: Optional[torch.Tensor] = None
     query_start_loc_p: Optional[torch.Tensor] = None
     padding_mask_flat: Optional[torch.Tensor] = None
+    gdn_metadata: Any = None
 
     def seq_len(self):
         return self.slot_mapping.size(-1)

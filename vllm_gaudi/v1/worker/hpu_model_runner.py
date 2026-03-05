@@ -510,6 +510,11 @@ class HpuModelAdapter(torch.nn.Module, HpuKVConnectorModelRunnerMixin):
                                            and self.sliding_window)
         self.metadata_processor = HPUAttentionMetadataProcessor(vllm_config)
 
+        # GDN (linear_attention) layer name mappings - populated by
+        # HPUModelRunner.initialize_kv_cache() after kv_cache groups are known
+        self._gdn_layer_names: list[str] = []
+        self._attn_layer_names: list[str] = []
+
         # for DP
         self.dummy_num_input_tokens = -1
         self.num_tokens_across_dp = [self.dummy_num_input_tokens] * self.vllm_config.parallel_config.data_parallel_size
@@ -582,6 +587,18 @@ class HpuModelAdapter(torch.nn.Module, HpuKVConnectorModelRunnerMixin):
         attn_meta = kwargs.pop('attn_metadata')
         if 'kv_caches' in kwargs:
             kwargs.pop('kv_caches')
+
+        # Wrap in dict for hybrid models with GDN (linear_attention) layers
+        _has_gdn_names = hasattr(self, '_gdn_layer_names') and bool(self._gdn_layer_names)
+        _has_gdn_meta = hasattr(attn_meta, 'gdn_metadata') and attn_meta.gdn_metadata is not None
+        if _has_gdn_names and _has_gdn_meta:
+            gdn_metadata = attn_meta.gdn_metadata
+            attn_meta_dict = {}
+            for layer_name in self._gdn_layer_names:
+                attn_meta_dict[layer_name] = gdn_metadata
+            for layer_name in self._attn_layer_names:
+                attn_meta_dict[layer_name] = attn_meta
+            attn_meta = attn_meta_dict
 
         # If multimodal inputs, update kwargs
         model_mm_kwargs = kwargs.pop('model_mm_kwargs', None)
@@ -691,7 +708,7 @@ def trim_attn_metadata(metadata: HPUAttentionMetadataV1) -> object:
         'window_block_usage', 'window_block_groups', 'window_attn_bias', 'chunked_block_mapping', 'chunked_attn_bias',
         'chunked_block_list', 'chunked_block_usage', 'chunked_block_groups', 'prep_initial_states',
         'has_initial_states_p', 'last_chunk_indices_p', 'state_indices_tensor', 'query_start_loc', 'query_start_loc_p',
-        'padding_mask_flat'
+        'padding_mask_flat', 'gdn_metadata'
     ])
     return attention_metadata
 
@@ -870,6 +887,11 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
 
         self.num_mamba_layers = self.model_config.get_num_layers_by_block_type(self.parallel_config, "mamba")
         self.mamba_chunk_size = self.model_config.get_mamba_chunk_size() if self.num_mamba_layers > 0 else 0
+        self.num_gdn_layers = self.model_config.get_num_layers_by_block_type(
+            self.parallel_config, "linear_attention")
+        self._gdn_layer_names: list[str] = []
+        self._attn_layer_names: list[str] = []
+        self._gdn_kv_cache_group_idx: int = -1
         self.use_hybrid_cache = os.getenv('VLLM_USE_HYBRID_CACHE', 'false').strip().lower() in ("1", "true")
         self.use_naive_mamba_cache_sharing = os.getenv('VLLM_USE_NAIVE_MAMBA_CACHE_SHARING',
                                                        'true').strip().lower() in ("1", "true")
@@ -1975,12 +1997,13 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             target_bs * target_seq <= self.max_num_tokens
 
     def _get_attention_group_id_for_hybrid(self):
-        if self.num_mamba_layers == 0 or len(self.kv_cache_config.kv_cache_groups) == 0:
+        if len(self.kv_cache_config.kv_cache_groups) <= 1:
             return 0
 
         for gid, group in enumerate(self.kv_cache_config.kv_cache_groups):
             if isinstance(group.kv_cache_spec, AttentionSpec):
                 return gid
+        return 0
 
     def _extract_prefill_batch_contents(self, num_prefills, num_decodes, num_scheduled_tokens, warmup=False):
         # DECODES are the first num_decodes REQUESTS.
@@ -2259,6 +2282,57 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                                                                      state_indices_tensor=state_indices_tensor,
                                                                      query_start_loc=query_start_loc_p,
                                                                      padding_mask_flat=padding_mask_flat)
+
+        if self.num_gdn_layers > 0:
+            from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
+
+            num_prefill_reqs = len(contents.req_ids)
+            gdn_gid = self._gdn_kv_cache_group_idx
+            block_table_cpu = self.input_batch.block_table[
+                gdn_gid].get_cpu_tensor()
+            gdn_state_indices = torch.zeros(
+                num_prefill_reqs, dtype=torch.int32)
+            for i, req_id in enumerate(contents.req_ids):
+                req_idx = self.input_batch.req_id_to_index[req_id]
+                gdn_state_indices[i] = block_table_cpu[req_idx, 0]
+
+            has_initial_state_cpu = torch.zeros(
+                num_prefill_reqs, dtype=torch.bool)
+            for i, req_id in enumerate(contents.req_ids):
+                req_idx = self.input_batch.req_id_to_index[req_id]
+                has_initial_state_cpu[i] = bool(
+                    self.input_batch.num_computed_tokens_cpu[req_idx] > 0)
+
+            orig_query_lens = [len(tids) for tids in contents.token_ids]
+            query_start_loc_cpu = torch.zeros(
+                num_prefill_reqs + 1, dtype=torch.int32)
+            query_start_loc_cpu[1:] = torch.cumsum(
+                torch.tensor(orig_query_lens, dtype=torch.int32), dim=0)
+            total_tokens = query_start_loc_cpu[-1].item()
+
+            gdn_state_indices_d = async_h2d_copy(
+                gdn_state_indices, device=self.device)
+            has_initial_state_d = async_h2d_copy(
+                has_initial_state_cpu, device=self.device)
+            query_start_loc_d = async_h2d_copy(
+                query_start_loc_cpu, device=self.device)
+
+            attn_metadata.gdn_metadata = GDNAttentionMetadata(
+                num_prefills=num_prefill_reqs,
+                num_prefill_tokens=total_tokens,
+                num_decodes=0,
+                num_decode_tokens=0,
+                num_spec_decodes=0,
+                num_spec_decode_tokens=0,
+                num_actual_tokens=total_tokens,
+                has_initial_state=has_initial_state_d,
+                non_spec_query_start_loc=query_start_loc_d,
+                non_spec_state_indices_tensor=gdn_state_indices_d,
+                non_spec_query_start_loc_cpu=query_start_loc_cpu,
+                non_spec_state_indices_cpu=gdn_state_indices,
+                has_initial_state_cpu=has_initial_state_cpu,
+            )
+
         return PrefillInputData(request_ids=[req_ids],
                                 prompt_lens=[query_lens],
                                 token_ids=[token_ids],
@@ -2628,6 +2702,36 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             seq_lens_tensor=seq_lens_tensor,
             query_start_loc=query_start_loc_p,
         )
+
+        if self.num_gdn_layers > 0:
+            from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
+
+            gdn_gid = self._gdn_kv_cache_group_idx
+            gdn_block_table_cpu = self.input_batch.block_table[
+                gdn_gid].get_cpu_tensor()
+            gdn_state_indices = gdn_block_table_cpu[
+                :num_decodes, 0].clone().to(torch.int32)
+
+            gdn_qsl_cpu = torch.arange(
+                num_decodes + 1, dtype=torch.int32)
+
+            gdn_state_indices_d = async_h2d_copy(
+                gdn_state_indices, device=self.device)
+            gdn_qsl_d = async_h2d_copy(gdn_qsl_cpu, device=self.device)
+
+            attn_metadata.gdn_metadata = GDNAttentionMetadata(
+                num_prefills=0,
+                num_prefill_tokens=0,
+                num_decodes=num_decodes,
+                num_decode_tokens=num_decodes,
+                num_spec_decodes=0,
+                num_spec_decode_tokens=0,
+                num_actual_tokens=num_decodes,
+                non_spec_query_start_loc=gdn_qsl_d,
+                non_spec_state_indices_tensor=gdn_state_indices_d,
+                non_spec_query_start_loc_cpu=gdn_qsl_cpu,
+                non_spec_state_indices_cpu=gdn_state_indices,
+            )
 
         return DecodeInputData(num_decodes=num_decodes,
                                token_ids=token_ids_device,
@@ -4185,6 +4289,11 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             htcore.mark_step()
 
         apply_model_specific_patches(self)
+
+        # Monkey-patch GDN (Gated Delta Net) ops for HPU
+        if self.num_gdn_layers > 0:
+            self._patch_gdn_ops_for_hpu()
+
         hidden_layer_markstep_interval = int(os.getenv('VLLM_CONFIG_HIDDEN_LAYERS', '1'))
         model_config = getattr(self.model, "config", None)
         modify_model_layers(self.model,
@@ -4200,6 +4309,50 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 )
         self.model_memory_usage = m.consumed_device_memory
         logger.info("Wrapping in HPUGraph took %.4f GB", self.model_memory_usage / float(2**30))
+
+    def _patch_gdn_ops_for_hpu(self):
+        """Replace Triton-based GDN ops with PyTorch HPU implementations."""
+        import sys
+        qwen3_next_mod = sys.modules.get(
+            'vllm.model_executor.models.qwen3_next')
+        if qwen3_next_mod is None:
+            logger.warning("qwen3_next module not loaded, skipping GDN "
+                           "monkey-patch")
+            return
+
+        from vllm_gaudi.ops.hpu_gdn_ops import (
+            hpu_gdn_causal_conv1d_fn,
+            hpu_gdn_causal_conv1d_update,
+            hpu_fused_gdn_gating,
+            hpu_fused_recurrent_gated_delta_rule,
+            hpu_chunk_gated_delta_rule,
+        )
+
+        qwen3_next_mod.causal_conv1d_fn = hpu_gdn_causal_conv1d_fn
+        qwen3_next_mod.causal_conv1d_update = hpu_gdn_causal_conv1d_update
+        qwen3_next_mod.fused_gdn_gating = hpu_fused_gdn_gating
+        qwen3_next_mod.chunk_gated_delta_rule = hpu_chunk_gated_delta_rule
+        qwen3_next_mod.fused_recurrent_gated_delta_rule = (
+            hpu_fused_recurrent_gated_delta_rule
+        )
+
+        # Also patch the fla ops module
+        fla_ops_mod = sys.modules.get(
+            'vllm.model_executor.layers.fla.ops')
+        if fla_ops_mod:
+            fla_ops_mod.chunk_gated_delta_rule = hpu_chunk_gated_delta_rule
+            fla_ops_mod.fused_recurrent_gated_delta_rule = (
+                hpu_fused_recurrent_gated_delta_rule
+            )
+
+        # Patch the causal_conv1d ops module
+        conv1d_mod = sys.modules.get(
+            'vllm.model_executor.layers.mamba.ops.causal_conv1d')
+        if conv1d_mod:
+            conv1d_mod.causal_conv1d_fn = hpu_gdn_causal_conv1d_fn
+            conv1d_mod.causal_conv1d_update = hpu_gdn_causal_conv1d_update
+
+        logger.info("Patched GDN ops with HPU PyTorch implementations")
 
         ########### Spec Decode model ############
         if hasattr(self, "drafter"):
@@ -4734,9 +4887,11 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         if self.speculative_config and self.speculative_config.use_eagle():
             # Consider the block space for draft tokens to propose
             total_tokens_for_blocks += self.speculative_config.num_speculative_tokens
-            # Check the limit of the max model length
-            if total_tokens_for_blocks > self.max_model_len:
-                total_tokens_for_blocks = self.max_model_len
+        # Clamp to max_model_len so that block counts stay within the
+        # allocated block-table dimensions (important for hybrid models
+        # where mamba_block_size == max_model_len).
+        if total_tokens_for_blocks > self.max_model_len:
+            total_tokens_for_blocks = self.max_model_len
 
         prompt_token_ids = list(range(total_tokens))
         num_blocks = round_up(total_tokens_for_blocks, self.block_size) // self.block_size
@@ -4744,7 +4899,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         req_id = f'{len(requests)}'
         block_ids = [[block_id] *
                      (round_up(total_tokens_for_blocks, g.kv_cache_spec.block_size) // g.kv_cache_spec.block_size)
-                     for g in self.kv_cache_config.kv_cache_groups] if self.num_mamba_layers > 0 else [[block_id] *
+                     for g in self.kv_cache_config.kv_cache_groups] if len(self.kv_cache_config.kv_cache_groups) > 1 else [[block_id] *
                                                                                                        num_blocks]
         if self.is_pooling_model:
             model = cast(VllmModelForPooling, self.get_model())
@@ -5261,7 +5416,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             else:
                 max_bucket = max(self.bucketing_manager.decode_buckets[-1][0],
                                  self.bucketing_manager.prompt_buckets[-1][0])
-            if not self.num_mamba_layers and max_bucket > self.input_batch.max_num_reqs:
+            is_hybrid_cache = len(self.kv_cache_config.kv_cache_groups) > 1
+            if not self.num_mamba_layers and not is_hybrid_cache and max_bucket > self.input_batch.max_num_reqs:
                 input_batch_bkp = self.input_batch
                 self.input_batch = InputBatch(
                     max_num_reqs=self.bucketing_manager.decode_buckets[-1][0],
@@ -5363,7 +5519,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         logger.info(msg)
         self.profiler.end()
 
-        if not (self.num_mamba_layers or self.unified_attn or self.is_pooling_model) \
+        if not (self.num_mamba_layers or self.unified_attn or self.is_pooling_model or is_hybrid_cache) \
              and max_bucket > self.input_batch.max_num_reqs:
             self.input_batch = input_batch_bkp
         # NOTE(kzawora): This is a nasty workaround - for whatever cache_utils-related reason,
@@ -5576,6 +5732,18 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         self.kv_cache_config = kv_cache_config
         if self.num_mamba_layers > 0:
             maybe_set_mamba_kv_cache_groups_ids(self.model, self.kv_cache_config)
+        if self.num_gdn_layers > 0:
+            for gid, group in enumerate(kv_cache_config.kv_cache_groups):
+                if isinstance(group.kv_cache_spec, MambaSpec):
+                    self._gdn_kv_cache_group_idx = gid
+            # Collect ALL layer names from static_forward_context
+            # (kv_cache_groups only has this rank's subset)
+            forward_ctx = self.vllm_config.compilation_config.static_forward_context
+            for layer_name, module in forward_ctx.items():
+                if isinstance(module, MambaBase):
+                    self._gdn_layer_names.append(layer_name)
+                elif isinstance(module, (Attention, MLAAttention)):
+                    self._attn_layer_names.append(layer_name)
         # if len(kv_cache_config.kv_cache_groups) > 1:
         block_sizes = [kv_cache_group.kv_cache_spec.block_size for kv_cache_group in kv_cache_config.kv_cache_groups]
         if block_sizes != [self.cache_config.block_size]:
@@ -5792,6 +5960,10 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         # TODO: check if this one is needed; for now seems that not
         # if has_mamba:
         #     self._update_hybrid_attention_mamba_layout(kv_caches)
+
+        if self.num_gdn_layers > 0:
+            self.model._gdn_layer_names = self._gdn_layer_names
+            self.model._attn_layer_names = self._attn_layer_names
 
         htorch.hpu.synchronize()
 

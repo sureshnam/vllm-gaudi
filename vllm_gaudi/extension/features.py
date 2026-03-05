@@ -107,7 +107,7 @@ def get_features():
         Value('unified_attn', False),
         *unified_attn_dev_flags(),
         Value('scale_adjustment', True, env_var='VLLM_SCALE_ADJUSTMENT', env_var_type=boolean),
-        Value('flatten_input', Any(ModelType('qwen3_moe'), ModelType('granitemoe'), ModelType('glm4_moe'))),
+        Value('flatten_input', Any(ModelType('qwen3_moe'), ModelType('granitemoe'), ModelType('glm4_moe'), ModelType('qwen3_5_moe'), ModelType('qwen3_5_moe_text'))),
         Value('unified_attn_shared_cache_ratio',
               1,
               env_var='VLLM_UNIFIED_ATTENTION_SHARED_CACHE_RATIO',
